@@ -145,6 +145,10 @@ Resources:
             systemctl start docker
           fi
 
+          # Add ec2-user to docker group for permission to run docker commands
+          echo "Adding ec2-user to docker group"
+          usermod -aG docker ec2-user
+
           echo "[3/9] Prepare data mount at /opt/oracle/oradata"
           mkdir -p /opt/oracle/oradata
 
@@ -173,15 +177,24 @@ Resources:
           UUID=$(blkid -s UUID -o value "$DATA_DEV")
           grep -q "/opt/oracle/oradata" /etc/fstab || echo "UUID=$UUID /opt/oracle/oradata xfs defaults,noatime 0 2" >> /etc/fstab
           mount -a
-          chown -R root:root /opt/oracle/oradata
-          chmod 755 /opt/oracle/oradata
+
+          # Fix permissions for Oracle container (runs as user 54321)
+          echo "Setting proper permissions for Oracle container"
+          chown -R 54321:54321 /opt/oracle/oradata
+          chmod -R 755 /opt/oracle/oradata
+
+          # Create required Oracle directories
+          mkdir -p /opt/oracle/oradata/FREE/FREEPDB1
+          mkdir -p /opt/oracle/oradata/FREE/pdbseed
+          chown -R 54321:54321 /opt/oracle/oradata/FREE
+          chmod -R 755 /opt/oracle/oradata/FREE
 
           echo "[4/9] Pull latest Oracle Free image"
           docker pull gvenzl/oracle-free:latest
 
           echo "[5/9] Run Oracle container"
-          docker rm -f oracle-free || true
-          docker run -d --name oracle-free \
+          docker rm -f sharvan-kumar-afe-oracle-free || true
+          docker run -d --name sharvan-kumar-afe-oracle-free \
             -p 1521:1521 \
             -e ORACLE_PASSWORD='${OraclePassword}' \
             -e ORACLE_CHARACTERSET=AL32UTF8 \
@@ -190,7 +203,7 @@ Resources:
 
           echo "[6/9] Wait for database readiness"
           for i in $(seq 1 180); do
-            if docker logs oracle-free 2>&1 | grep -q "DATABASE IS READY TO USE!"; then
+            if docker logs sharvan-kumar-afe-oracle-free 2>&1 | grep -q "DATABASE IS READY TO USE!"; then
               echo "DB is ready"
               break
             fi
@@ -205,8 +218,8 @@ Resources:
           fi
 
           echo "[8/9] Copy schemas into container"
-          docker exec oracle-free mkdir -p /tmp/schemas
-          docker cp db-sample-schemas/. oracle-free:/tmp/schemas/
+          docker exec sharvan-kumar-afe-oracle-free mkdir -p /tmp/schemas
+          docker cp db-sample-schemas/. sharvan-kumar-afe-oracle-free:/tmp/schemas/
 
           echo "[9/9] Install HR and CO schemas into FREEPDB1"
           INSTALL_SCRIPT_HOST=/opt/oracle/install_schemas.sql
@@ -214,15 +227,15 @@ Resources:
           WHENEVER SQLERROR EXIT SQL.SQLCODE
           ALTER SESSION SET CONTAINER = FREEPDB1;
           -- Create dedicated tablespaces to avoid default USERS
-          CREATE TABLESPACE HR_DATA DATAFILE '/opt/oracle/oradata/FREEPDB1/hr_data01.dbf' SIZE 200M AUTOEXTEND ON NEXT 50M MAXSIZE UNLIMITED;
-          CREATE TEMPORARY TABLESPACE HR_TEMP TEMPFILE '/opt/oracle/oradata/FREEPDB1/hr_temp01.dbf' SIZE 100M AUTOEXTEND ON NEXT 50M MAXSIZE UNLIMITED;
+          CREATE TABLESPACE HR_DATA DATAFILE '/opt/oracle/oradata/FREE/FREEPDB1/hr_data01.dbf' SIZE 200M AUTOEXTEND ON NEXT 50M MAXSIZE UNLIMITED;
+          CREATE TEMPORARY TABLESPACE HR_TEMP TEMPFILE '/opt/oracle/oradata/FREE/FREEPDB1/hr_temp01.dbf' SIZE 100M AUTOEXTEND ON NEXT 50M MAXSIZE UNLIMITED;
           CREATE USER HR IDENTIFIED BY hr ACCOUNT UNLOCK DEFAULT TABLESPACE HR_DATA TEMPORARY TABLESPACE HR_TEMP QUOTA UNLIMITED ON HR_DATA;
           GRANT CONNECT, RESOURCE, CREATE VIEW, CREATE SEQUENCE, CREATE TRIGGER, CREATE PROCEDURE, CREATE SYNONYM TO HR;
           GRANT UNLIMITED TABLESPACE TO HR;
 
           -- CO schema prerequisites
-          CREATE TABLESPACE CO_DATA DATAFILE '/opt/oracle/oradata/FREEPDB1/co_data01.dbf' SIZE 500M AUTOEXTEND ON NEXT 100M MAXSIZE UNLIMITED;
-          CREATE TEMPORARY TABLESPACE CO_TEMP TEMPFILE '/opt/oracle/oradata/FREEPDB1/co_temp01.dbf' SIZE 200M AUTOEXTEND ON NEXT 100M MAXSIZE UNLIMITED;
+          CREATE TABLESPACE CO_DATA DATAFILE '/opt/oracle/oradata/FREE/FREEPDB1/co_data01.dbf' SIZE 500M AUTOEXTEND ON NEXT 100M MAXSIZE UNLIMITED;
+          CREATE TEMPORARY TABLESPACE CO_TEMP TEMPFILE '/opt/oracle/oradata/FREE/FREEPDB1/co_temp01.dbf' SIZE 200M AUTOEXTEND ON NEXT 100M MAXSIZE UNLIMITED;
           CREATE USER CO IDENTIFIED BY co ACCOUNT UNLOCK DEFAULT TABLESPACE CO_DATA TEMPORARY TABLESPACE CO_TEMP QUOTA UNLIMITED ON CO_DATA;
           GRANT CONNECT, RESOURCE, CREATE VIEW, CREATE SEQUENCE, CREATE TRIGGER, CREATE PROCEDURE, CREATE SYNONYM, CREATE TYPE, CREATE SESSION TO CO;
           GRANT UNLIMITED TABLESPACE TO CO;
@@ -230,20 +243,40 @@ Resources:
           EOSQL
 
           # Copy the driver SQL into the container
-          docker cp "$INSTALL_SCRIPT_HOST" oracle-free:/tmp/install_schemas.sql
+          docker cp "$INSTALL_SCRIPT_HOST" sharvan-kumar-afe-oracle-free:/tmp/install_schemas.sql
 
           # Run pre-create users/tablespaces
-          docker exec -i oracle-free bash -lc "sqlplus -s system/${OraclePassword}@localhost:1521/FREEPDB1 @/tmp/install_schemas.sql"
+          docker exec -i sharvan-kumar-afe-oracle-free bash -lc "sqlplus -s system/${OraclePassword}@localhost:1521/FREEPDB1 @/tmp/install_schemas.sql"
 
-          # Attempt running provided installers (best-effort, with defaults)
-          docker exec -i oracle-free bash -lc "cd /tmp/schemas/human_resources && echo -e '\n\n\n' | sqlplus -s system/${OraclePassword}@localhost:1521/FREEPDB1 @hr_install.sql"
-          docker exec -i oracle-free bash -lc "cd /tmp/schemas/customer_orders && echo -e '\n\n\n' | sqlplus -s system/${OraclePassword}@localhost:1521/FREEPDB1 @co_install.sql"
+          # Install HR schema as HR user
+          echo "Installing HR schema as HR user..."
+          docker exec -i sharvan-kumar-afe-oracle-free bash -lc "cd /tmp/schemas/human_resources && sqlplus -s hr/hr@localhost:1521/FREEPDB1 @hr_create.sql"
+
+          # Populate HR schema with sample data as HR user
+          echo "Populating HR schema with data as HR user..."
+          docker exec -i sharvan-kumar-afe-oracle-free bash -lc "cd /tmp/schemas/human_resources && sqlplus -s hr/hr@localhost:1521/FREEPDB1 @hr_populate.sql"
+
+          # Install CO schema as CO user
+          echo "Installing CO schema as CO user..."
+          docker exec -i sharvan-kumar-afe-oracle-free bash -lc "cd /tmp/schemas/customer_orders && sqlplus -s co/co@localhost:1521/FREEPDB1 @co_create.sql"
+
+          # Populate CO schema with sample data as CO user
+          echo "Populating CO schema with data as CO user..."
+          docker exec -i sharvan-kumar-afe-oracle-free bash -lc "cd /tmp/schemas/customer_orders && sqlplus -s co/co@localhost:1521/FREEPDB1 @co_populate.sql"
+
+          # Verify schema installation
+          echo "Verifying schema installation..."
+          docker exec -i sharvan-kumar-afe-oracle-free bash -lc "sqlplus -s system/${OraclePassword}@localhost:1521/FREEPDB1 << 'EOF'
+          SELECT 'HR Tables: ' || COUNT(*) FROM dba_tables WHERE owner = 'HR';
+          SELECT 'CO Tables: ' || COUNT(*) FROM dba_tables WHERE owner = 'CO';
+          EXIT;
+          EOF"
 
           echo "Bootstrap complete"
 
       Tags:
         - Key: Name
-          Value: OracleFree23-EC2
+          Value: OracleFree23-Sharvan
 
   # EIPAssociation removed - using auto-assigned public IP
 
