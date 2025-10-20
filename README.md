@@ -6,38 +6,84 @@ References:
 - Oracle Sample Schemas (HR, CO): `https://github.com/oracle-samples/db-sample-schemas`
 
 ## What gets created
-- VPC (A), public subnet, IGW, routes
-- EC2 with Docker, EIP, SG allowing SSH (22) and Oracle listener (1521)
+- EC2 with Docker, auto-assigned public IP, SG allowing SSH (22) and Oracle listener (1521)
 - EBS volume, mounted at `/opt/oracle/oradata`, mapped into container for persistence
-- Docker container `gvenzl/oracle-free:23`
-- Automated install of HR and CO schemas into `FREEPDB1`
+- Docker container `sharvan-kumar-afe-oracle-free` using `gvenzl/oracle-free:latest`
+- Automated install of HR and CO schemas into `FREEPDB1` with sample data
+- Uses existing VPC and subnet (no new networking resources created)
 
-## Prereqs
-- AWS account permissions to create VPC/EC2/IAM/EIP
+## Prerequisites
+- AWS account with permissions to create EC2/IAM/EBS
 - Existing EC2 key pair name
+- Existing VPC with public subnet and Internet Gateway
+- Docker daemon access (automatically configured)
 
-## Deploy main stack (DB)
-1. Open AWS CloudFormation, Create stack with new resources.
-2. Upload `main-oracle-free23.yaml`.
-3. Set parameters:
-   - KeyPairName: your existing key pair
-   - AllowedSSHLocation: demo default `0.0.0.0/0` (use your IP/CIDR for security)
-   - AllowedDBClientCidr: default `0.0.0.0/0` (use your client IP/CIDR to restrict)
-   - OraclePassword: 12+ chars
-   - InstanceType: default `t3.large`
-   - VolumeSizeGiB: default `200`
-   - VpcCidr / PublicSubnetCidr: accept defaults unless needed
-4. Create stack and wait for completion. Note the Outputs:
-   - `InstancePublicIp`, `InstancePrivateIp`, `SecurityGroupId`, `PublicRouteTableId`, `VpcId`
+## Step 1: Find Your VPC and Subnet IDs
 
-## Connect to the database
-- Public (demo):
-  - Host: `InstancePublicIp`
-  - Port: `1521`
-  - Service: `FREEPDB1`
-  - User: `system` (password = the value you passed), or schema users like `HR/hr`, `CO/co` if installs succeeded
-- SSH:
-  - `ssh -i <key.pem> ec2-user@<InstancePublicIp>` (Amazon Linux 2023)
+### Option A: Using AWS Console
+1. Go to **VPC Console** → **VPCs**
+2. Note your VPC ID (e.g., `vpc-12345678`)
+3. Go to **Subnets** → Find a public subnet (one with route to IGW)
+4. Note the Subnet ID (e.g., `subnet-12345678`)
+
+### Option B: Using AWS CLI
+```bash
+# List VPCs
+aws ec2 describe-vpcs --query 'Vpcs[*].[VpcId,Tags[?Key==`Name`].Value|[0]]' --output table
+
+# List public subnets
+aws ec2 describe-subnets --filters "Name=vpc-id,Values=vpc-12345678" --query 'Subnets[*].[SubnetId,AvailabilityZone,Tags[?Key==`Name`].Value|[0]]' --output table
+```
+
+## Step 2: Deploy Main Stack (Oracle Database)
+
+1. **Open AWS CloudFormation** → Create stack with new resources
+2. **Upload template**: `main-oracle-free23.yaml`
+3. **Set parameters**:
+   - `KeyPairName`: Your existing EC2 key pair name
+   - `VpcId`: Your existing VPC ID (e.g., `vpc-12345678`)
+   - `SubnetId`: Your existing public subnet ID (e.g., `subnet-12345678`)
+   - `AllowedSSHLocation`: Your IP/CIDR (e.g., `203.0.113.10/32`) or `0.0.0.0/0` for demo
+   - `AllowedDBClientCidr`: Your IP/CIDR or `0.0.0.0/0` for demo
+   - `OraclePassword`: Strong password (12+ characters)
+   - `InstanceType`: `t3.large` (default)
+   - `VolumeSizeGiB`: `200` (default)
+4. **Create stack** and wait for completion (~15-20 minutes)
+5. **Note the outputs**:
+   - `InstancePublicIp`: Public IP for database access
+   - `InstancePrivateIp`: Private IP for VPC peering
+   - `SecurityGroupId`: For VPC peering setup
+
+## Step 3: Connect to the Database
+
+### From Your Local Machine
+- **Host**: `InstancePublicIp` (from CloudFormation outputs)
+- **Port**: `1521`
+- **Service**: `FREEPDB1`
+- **Users**: 
+  - `system/<your-password>` (admin access)
+  - `hr/hr` (HR schema access)
+  - `co/co` (CO schema access)
+
+### SSH to EC2 Instance
+```bash
+ssh -i <your-key.pem> ec2-user@<InstancePublicIp>
+```
+
+### Docker Commands (from EC2)
+```bash
+# Check container status
+docker ps
+
+# View Oracle logs
+docker logs sharvan-kumar-afe-oracle-free
+
+# Connect to container bash
+docker exec -it sharvan-kumar-afe-oracle-free bash
+
+# Connect to database
+docker exec -it sharvan-kumar-afe-oracle-free sqlplus system/<password>@localhost:1521/FREEPDB1
+```
 
 ## Restrict access to only your client IP later
 - Update the main stack with a narrower `AllowedDBClientCidr` (e.g., `203.0.113.10/32`).
@@ -59,12 +105,49 @@ Use `vpc-b-peering.yaml` as a separate stack.
 ## Data persistence
 - Data is on EBS mounted at `/opt/oracle/oradata` and bound into the container (`/opt/oracle/oradata:/opt/oracle/oradata`). DB state survives container/instance restarts.
 
-## Verify sample schemas
-- SSH to the EC2 instance and check container logs: `sudo docker logs oracle-free | tail -n 200`
-- Connect and validate tables:
-  - `sqlplus system/<password>@<public or private ip>:1521/FREEPDB1`
-  - Try `select count(*) from hr.employees;` or CO objects if created.
-- If the provided installers prompt unexpectedly, the template also pre-creates users/tablespaces; you can run individual scripts from the repo inside the container if needed.
+## Step 4: Verify Sample Schemas
+
+### Check Container Status
+```bash
+# SSH to EC2 instance
+ssh -i <your-key.pem> ec2-user@<InstancePublicIp>
+
+# Check container logs
+docker logs sharvan-kumar-afe-oracle-free | tail -n 50
+```
+
+### Verify HR Schema
+```bash
+# Connect as HR user and check tables
+docker exec -it sharvan-kumar-afe-oracle-free sqlplus hr/hr@localhost:1521/FREEPDB1 << EOF
+SELECT table_name FROM user_tables ORDER BY table_name;
+SELECT COUNT(*) FROM employees;
+SELECT COUNT(*) FROM departments;
+EXIT;
+EOF
+```
+
+### Verify CO Schema
+```bash
+# Connect as CO user and check tables
+docker exec -it sharvan-kumar-afe-oracle-free sqlplus co/co@localhost:1521/FREEPDB1 << EOF
+SELECT table_name FROM user_tables ORDER BY table_name;
+SELECT COUNT(*) FROM customers;
+SELECT COUNT(*) FROM orders;
+EXIT;
+EOF
+```
+
+### Check Schema Installation from SYSTEM
+```bash
+# Connect as SYSTEM and verify schemas
+docker exec -it sharvan-kumar-afe-oracle-free sqlplus system/<password>@localhost:1521/FREEPDB1 << EOF
+SELECT 'HR Tables: ' || COUNT(*) FROM dba_tables WHERE owner = 'HR';
+SELECT 'CO Tables: ' || COUNT(*) FROM dba_tables WHERE owner = 'CO';
+SELECT table_name FROM dba_tables WHERE owner = 'HR' ORDER BY table_name;
+EXIT;
+EOF
+```
 
 ## Teardown (graceful delete)
 - Delete the VPC B + peering stack first (if created).
