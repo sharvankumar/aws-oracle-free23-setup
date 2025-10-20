@@ -148,13 +148,7 @@ Resources:
       Roles:
         - !Ref InstanceProfileRole
 
-  EIP:
-    Type: AWS::EC2::EIP
-    Properties:
-      Domain: vpc
-      Tags:
-        - Key: Name
-          Value: OracleFree23-EIP
+  # EIP removed due to SCP restrictions - using auto-assigned public IP instead
 
   EC2Instance:
     Type: AWS::EC2::Instance
@@ -305,11 +299,7 @@ Resources:
         - Key: Name
           Value: OracleFree23-EC2
 
-  EIPAssociation:
-    Type: AWS::EC2::EIPAssociation
-    Properties:
-      AllocationId: !GetAtt EIP.AllocationId
-      InstanceId: !Ref EC2Instance
+  # EIPAssociation removed - using auto-assigned public IP
 
 Outputs:
   VpcId:
@@ -336,15 +326,15 @@ Outputs:
     Description: EC2 Instance ID
     Value: !Ref EC2Instance
   InstancePublicIp:
-    Description: Public IP of the DB host
-    Value: !Ref EIP
+    Description: Public IP of the DB host (auto-assigned)
+    Value: !GetAtt EC2Instance.PublicIp
   InstancePrivateIp:
     Description: Private IP of the DB host
     Value: !GetAtt EC2Instance.PrivateIp
   ListenerEndpoint:
     Description: Oracle listener endpoint
     Value: !Sub |
-      Host (public): ${EIP}
+      Host (public): ${EC2Instance.PublicIp}
       Port: 1521
       Service: FREEPDB1
 
