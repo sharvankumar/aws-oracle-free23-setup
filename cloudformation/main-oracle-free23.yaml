@@ -232,8 +232,8 @@ Resources:
           chown -R root:root /opt/oracle/oradata
           chmod 755 /opt/oracle/oradata
 
-          echo "[4/9] Pull Oracle Free 23 image"
-          docker pull gvenzl/oracle-free:23
+          echo "[4/9] Pull latest Oracle Free image"
+          docker pull gvenzl/oracle-free:latest
 
           echo "[5/9] Run Oracle container"
           docker rm -f oracle-free || true
@@ -242,7 +242,7 @@ Resources:
             -e ORACLE_PASSWORD='${OraclePassword}' \
             -e ORACLE_CHARACTERSET=AL32UTF8 \
             -v /opt/oracle/oradata:/opt/oracle/oradata \
-            gvenzl/oracle-free:23
+            gvenzl/oracle-free:latest
 
           echo "[6/9] Wait for database readiness"
           for i in $(seq 1 180); do
@@ -351,4 +351,3 @@ Outputs:
       Host (private): ${EC2Instance.PrivateIp}
       Port: 1521
       Service: FREEPDB1
-
