@@ -1,0 +1,284 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Oracle Database Free 23ai on EC2 (Docker) with persistent EBS and automated HR & CO sample schema installation.
+  Exposes SSH (22) and Oracle listener (1521). Fully parameterized, region-agnostic.
+
+Parameters:
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Existing EC2 KeyPair to enable SSH access
+  AllowedSSHLocation:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: CIDR permitted to SSH to the instance (demo default is 0.0.0.0/0)
+  AllowedDBClientCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: CIDR permitted to access port 1521 (Oracle listener). Use client IP/CIDR to restrict.
+  OraclePassword:
+    Type: String
+    NoEcho: true
+    MinLength: 12
+    Description: Strong password for SYS, SYSTEM, PDBADMIN (used by the image). Minimum 12 chars.
+  InstanceType:
+    Type: String
+    Default: t3.large
+    AllowedValues:
+      - t3.large
+      - t3.xlarge
+      - m6i.large
+      - m6i.xlarge
+    Description: EC2 instance type
+  VolumeSizeGiB:
+    Type: Number
+    Default: 200
+    MinValue: 50
+    MaxValue: 16384
+    Description: EBS data volume size in GiB
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Existing VPC ID where the instance will be deployed
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Existing subnet ID where the instance will be deployed
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: AMI ID for the EC2 instance
+
+Mappings: {}
+
+Resources:
+  # Using existing VPC and subnet to avoid SCP restrictions
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow SSH and Oracle listener
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AllowedSSHLocation
+        - IpProtocol: tcp
+          FromPort: 1521
+          ToPort: 1521
+          CidrIp: !Ref AllowedDBClientCidr
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: OracleFree23-DB-SG
+
+  InstanceProfileRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: OracleFree23-EC2Role
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref InstanceProfileRole
+
+  # EIP removed due to SCP restrictions - using auto-assigned public IP instead
+
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          files: {}
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      KeyName: !Ref KeyPairName
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: true
+          DeviceIndex: 0
+          GroupSet:
+            - !Ref SecurityGroup
+          SubnetId: !Ref SubnetId
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            DeleteOnTermination: true
+            VolumeSize: 20
+            VolumeType: gp3
+        - DeviceName: /dev/sdf
+          Ebs:
+            DeleteOnTermination: true
+            VolumeSize: !Ref VolumeSizeGiB
+            VolumeType: gp3
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euo pipefail
+
+          exec > >(tee -a /var/log/user-data.log) 2>&1
+
+          echo "[1/9] Update packages"
+          apt-get update -y || yum update -y || true
+
+          echo "[2/9] Install Docker, git, jq"
+          if command -v apt-get >/dev/null 2>&1; then
+            apt-get install -y docker.io git jq
+            systemctl enable docker
+            systemctl start docker
+          else
+            yum install -y docker git jq
+            systemctl enable docker
+            systemctl start docker
+          fi
+
+          echo "[3/9] Prepare data mount at /opt/oracle/oradata"
+          mkdir -p /opt/oracle/oradata
+
+          # Identify the non-root EBS device (Nitro instances expose as nvme1n1)
+          DATA_DEV=""
+          if ls /dev/nvme1n1 >/dev/null 2>&1; then
+            DATA_DEV="/dev/nvme1n1"
+          elif ls /dev/xvdf >/dev/null 2>&1; then
+            DATA_DEV="/dev/xvdf"
+          elif ls /dev/sdf >/dev/null 2>&1; then
+            DATA_DEV="/dev/sdf"
+          fi
+
+          if [ -z "$DATA_DEV" ]; then
+            echo "ERROR: Data device not found" >&2
+            exit 1
+          fi
+
+          # Format if unformatted
+          if ! blkid "$DATA_DEV"; then
+            echo "Formatting $DATA_DEV as xfs"
+            mkfs -t xfs "$DATA_DEV"
+          fi
+
+          # Mount and persist
+          UUID=$(blkid -s UUID -o value "$DATA_DEV")
+          grep -q "/opt/oracle/oradata" /etc/fstab || echo "UUID=$UUID /opt/oracle/oradata xfs defaults,noatime 0 2" >> /etc/fstab
+          mount -a
+          chown -R root:root /opt/oracle/oradata
+          chmod 755 /opt/oracle/oradata
+
+          echo "[4/9] Pull latest Oracle Free image"
+          docker pull gvenzl/oracle-free:latest
+
+          echo "[5/9] Run Oracle container"
+          docker rm -f oracle-free || true
+          docker run -d --name oracle-free \
+            -p 1521:1521 \
+            -e ORACLE_PASSWORD='${OraclePassword}' \
+            -e ORACLE_CHARACTERSET=AL32UTF8 \
+            -v /opt/oracle/oradata:/opt/oracle/oradata \
+            gvenzl/oracle-free:latest
+
+          echo "[6/9] Wait for database readiness"
+          for i in $(seq 1 180); do
+            if docker logs oracle-free 2>&1 | grep -q "DATABASE IS READY TO USE!"; then
+              echo "DB is ready"
+              break
+            fi
+            sleep 10
+          done
+
+          echo "[7/9] Fetch sample schemas"
+          mkdir -p /opt/oracle/sample-schemas
+          cd /opt/oracle/sample-schemas
+          if [ ! -d db-sample-schemas ]; then
+            git clone https://github.com/oracle-samples/db-sample-schemas.git
+          fi
+
+          echo "[8/9] Copy schemas into container"
+          docker exec oracle-free mkdir -p /tmp/schemas
+          docker cp db-sample-schemas/. oracle-free:/tmp/schemas/
+
+          echo "[9/9] Install HR and CO schemas into FREEPDB1"
+          INSTALL_SCRIPT_HOST=/opt/oracle/install_schemas.sql
+          cat > "$INSTALL_SCRIPT_HOST" <<'EOSQL'
+          WHENEVER SQLERROR EXIT SQL.SQLCODE
+          ALTER SESSION SET CONTAINER = FREEPDB1;
+          -- Create dedicated tablespaces to avoid default USERS
+          CREATE TABLESPACE HR_DATA DATAFILE '/opt/oracle/oradata/FREEPDB1/hr_data01.dbf' SIZE 200M AUTOEXTEND ON NEXT 50M MAXSIZE UNLIMITED;
+          CREATE TEMPORARY TABLESPACE HR_TEMP TEMPFILE '/opt/oracle/oradata/FREEPDB1/hr_temp01.dbf' SIZE 100M AUTOEXTEND ON NEXT 50M MAXSIZE UNLIMITED;
+          CREATE USER HR IDENTIFIED BY hr ACCOUNT UNLOCK DEFAULT TABLESPACE HR_DATA TEMPORARY TABLESPACE HR_TEMP QUOTA UNLIMITED ON HR_DATA;
+          GRANT CONNECT, RESOURCE, CREATE VIEW, CREATE SEQUENCE, CREATE TRIGGER, CREATE PROCEDURE, CREATE SYNONYM TO HR;
+          GRANT UNLIMITED TABLESPACE TO HR;
+
+          -- CO schema prerequisites
+          CREATE TABLESPACE CO_DATA DATAFILE '/opt/oracle/oradata/FREEPDB1/co_data01.dbf' SIZE 500M AUTOEXTEND ON NEXT 100M MAXSIZE UNLIMITED;
+          CREATE TEMPORARY TABLESPACE CO_TEMP TEMPFILE '/opt/oracle/oradata/FREEPDB1/co_temp01.dbf' SIZE 200M AUTOEXTEND ON NEXT 100M MAXSIZE UNLIMITED;
+          CREATE USER CO IDENTIFIED BY co ACCOUNT UNLOCK DEFAULT TABLESPACE CO_DATA TEMPORARY TABLESPACE CO_TEMP QUOTA UNLIMITED ON CO_DATA;
+          GRANT CONNECT, RESOURCE, CREATE VIEW, CREATE SEQUENCE, CREATE TRIGGER, CREATE PROCEDURE, CREATE SYNONYM, CREATE TYPE, CREATE SESSION TO CO;
+          GRANT UNLIMITED TABLESPACE TO CO;
+          EXIT
+          EOSQL
+
+          # Copy the driver SQL into the container
+          docker cp "$INSTALL_SCRIPT_HOST" oracle-free:/tmp/install_schemas.sql
+
+          # Run pre-create users/tablespaces
+          docker exec -i oracle-free bash -lc "sqlplus -s system/${OraclePassword}@localhost:1521/FREEPDB1 @/tmp/install_schemas.sql"
+
+          # Attempt running provided installers (best-effort, with defaults)
+          docker exec -i oracle-free bash -lc "cd /tmp/schemas/human_resources && echo -e '\n\n\n' | sqlplus -s system/${OraclePassword}@localhost:1521/FREEPDB1 @hr_install.sql"
+          docker exec -i oracle-free bash -lc "cd /tmp/schemas/customer_orders && echo -e '\n\n\n' | sqlplus -s system/${OraclePassword}@localhost:1521/FREEPDB1 @co_install.sql"
+
+          echo "Bootstrap complete"
+
+      Tags:
+        - Key: Name
+          Value: OracleFree23-EC2
+
+  # EIPAssociation removed - using auto-assigned public IP
+
+Outputs:
+  VpcId:
+    Description: VPC ID (existing)
+    Value: !Ref VpcId
+    Export:
+      Name: OracleFree23-VpcId
+  SubnetId:
+    Description: Subnet ID (existing)
+    Value: !Ref SubnetId
+    Export:
+      Name: OracleFree23-SubnetId
+  SecurityGroupId:
+    Description: DB security group ID
+    Value: !Ref SecurityGroup
+    Export:
+      Name: OracleFree23-DBSecurityGroupId
+  InstanceId:
+    Description: EC2 Instance ID
+    Value: !Ref EC2Instance
+  InstancePublicIp:
+    Description: Public IP of the DB host (auto-assigned)
+    Value: !GetAtt EC2Instance.PublicIp
+  InstancePrivateIp:
+    Description: Private IP of the DB host
+    Value: !GetAtt EC2Instance.PrivateIp
+  ListenerEndpoint:
+    Description: Oracle listener endpoint
+    Value: !Sub |
+      Host (public): ${EC2Instance.PublicIp}
+      Port: 1521
+      Service: FREEPDB1
+
+      Host (private): ${EC2Instance.PrivateIp}
+      Port: 1521
+      Service: FREEPDB1
