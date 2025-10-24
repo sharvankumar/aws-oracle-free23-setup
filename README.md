@@ -38,7 +38,7 @@ aws ec2 describe-subnets --filters "Name=vpc-id,Values=vpc-12345678" --query 'Su
 ## Step 2: Deploy Main Stack (Oracle Database)
 
 1. **Open AWS CloudFormation** → Create stack with new resources
-2. **Upload template**: `main-oracle-free23.yaml`
+2. **Upload template**: `main-oracle-free23_withexistingVPC.yaml`
 3. **Set parameters**:
    - `KeyPairName`: Your existing EC2 key pair name
    - `VpcId`: Your existing VPC ID (e.g., `vpc-12345678`)
